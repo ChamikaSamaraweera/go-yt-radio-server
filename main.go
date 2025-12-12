@@ -3,11 +3,39 @@ package main
 import (
 	"context"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"strconv"
 	"time"
+
+	"github.com/joho/godotenv"
 )
+
+func getEnv(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return fallback
+}
+
+func loadConfig() (host, port string) {
+	// Try to load .env (ignores error if file not found)
+	_ = godotenv.Load() // safe — returns error if .env missing, but we ignore it
+
+	host = getEnv("HOST", "")
+	port = getEnv("PORT", "8080")
+
+	// Validate port
+	if _, err := strconv.Atoi(port); err != nil {
+		log.Printf("⚠️ Invalid PORT='%s', using 8080", port)
+		port = "8080"
+	}
+
+	return
+}
 
 func streamHandler(w http.ResponseWriter, r *http.Request) {
 	vidURL := r.URL.Query().Get("url")
@@ -16,88 +44,78 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Basic validation
 	if !isYouTubeURL(vidURL) {
 		http.Error(w, "Only YouTube/YouTube Music URLs allowed", http.StatusBadRequest)
 		return
 	}
 
-	// Set headers for streaming MP3
 	w.Header().Set("Content-Type", "audio/mpeg")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Build yt-dlp + ffmpeg pipeline:
-	// yt-dlp → stdout → ffmpeg → mp3 → HTTP
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second) // Increased to 45s for slower starts
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 
 	ytdlpCmd := exec.CommandContext(ctx, "yt-dlp",
-		"-f", "bestaudio[ext=m4a]/bestaudio", // prefer m4a (faster decode)
-		"-o", "-",                            // output to stdout
+		"-f", "bestaudio[ext=m4a]/bestaudio",
+		"-o", "-",
 		"--no-warnings",
 		"--quiet",
 		vidURL,
 	)
 
 	ffmpegCmd := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner", "-loglevel", "error", // suppress noise
-		"-i", "pipe:0",      // input from yt-dlp
-		"-f", "mp3",         // output MP3
-		"-ac", "2",          // stereo
-		"-ar", "44100",      // standard sample rate
-		"-b:a", "128k",      // good quality, low bandwidth
-		"-vn",               // no video
-		"pipe:1",            // output to stdout
+		"-hide_banner", "-loglevel", "error",
+		"-i", "pipe:0",
+		"-f", "mp3",
+		"-ac", "2",
+		"-ar", "44100",
+		"-b:a", "128k",
+		"-vn",
+		"pipe:1",
 	)
 
-	// Connect yt-dlp stdout → ffmpeg stdin
 	ytdlpStdout, err := ytdlpCmd.StdoutPipe()
 	if err != nil {
-		log.Printf("yt-dlp StdoutPipe failed: %v", err)
+		log.Printf("yt-dlp pipe: %v", err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)
 		return
 	}
 	ffmpegCmd.Stdin = ytdlpStdout
 
-	// Start yt-dlp
 	if err := ytdlpCmd.Start(); err != nil {
-		log.Printf("yt-dlp failed to start: %v", err)
-		http.Error(w, "Audio fetch failed", http.StatusServiceUnavailable)
+		log.Printf("yt-dlp start: %v", err)
+		http.Error(w, "Fetch failed", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Get ffmpeg stdout for streaming
 	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
 	if err != nil {
 		ytdlpCmd.Process.Kill()
-		log.Printf("ffmpeg StdoutPipe failed: %v", err)
+		log.Printf("ffmpeg pipe: %v", err)
 		http.Error(w, "Encoder setup failed", http.StatusInternalServerError)
 		return
 	}
 
-	// Start ffmpeg
 	if err := ffmpegCmd.Start(); err != nil {
 		ytdlpCmd.Process.Kill()
-		log.Printf("ffmpeg failed to start: %v", err)
+		log.Printf("ffmpeg start: %v", err)
 		http.Error(w, "Encoding failed", http.StatusInternalServerError)
 		return
 	}
 
-	// Handle client disconnect
+	// Kill on client disconnect
 	go func() {
-		<-r.Context().Done() // triggered when client disconnects
+		<-r.Context().Done()
 		ytdlpCmd.Process.Kill()
 		ffmpegCmd.Process.Kill()
 	}()
 
-	// Stream in chunks
-	buf := make([]byte, 64*1024) // 64KB — better for audio streaming
+	buf := make([]byte, 64*1024)
 	for {
 		n, err := ffmpegStdout.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				// Client gone — clean up
 				ytdlpCmd.Process.Kill()
 				ffmpegCmd.Process.Kill()
 				return
@@ -128,15 +146,32 @@ func isYouTubeURL(u string) bool {
 }
 
 func main() {
+	host, port := loadConfig()
+	addr := net.JoinHostPort(host, port)
+
 	http.HandleFunc("/radio/stream", streamHandler)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok","service":"Radio Backend"}`))
+		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	port := ":8080"
-	log.Printf("📻 Radio Server ready at http://localhost%s", port)
-	log.Printf("▶️  Try: http://localhost%s/radio/stream?url=https://youtu.be/dQw4w9WgXcQ", port)
-	log.Fatal(http.ListenAndServe(port, nil))
+	log.Printf("Radio Server listening on http://%s", addr)
+	if host == "" || host == "0.0.0.0" {
+		// Show LAN IP for convenience (optional)
+		if ip := getOutboundIP(); ip != "" {
+			log.Printf("LAN access: http://%s:%s", ip, port)
+		}
+	}
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+// getOutboundIP tries to detect LAN IP (for dev convenience only)
+func getOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
 }
