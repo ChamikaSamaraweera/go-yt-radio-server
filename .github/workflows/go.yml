@@ -1,0 +1,47 @@
+# .github/workflows/go.yml
+name: Go
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5  # ✅ Use v5 (newer, better caching)
+        with:
+          go-version: '1.23'       # ✅ Use latest stable (1.23 as of 2025)
+          cache: true              # ✅ Auto-cache go.mod/go.sum
+
+      - name: Verify go.mod
+        run: |
+          if [ ! -f "go.mod" ]; then
+            echo "❌ ERROR: go.mod not found. Is this a Go module?"
+            exit 1
+          fi
+          go mod tidy
+
+      - name: Build
+        run: |
+          # Build explicitly with output name (e.g., radio-server)
+          go build -ldflags="-s -w" -o radio-server .
+          ls -lh radio-server
+
+      - name: (Optional) Test
+        # Skip if no _test.go files — avoids failure
+        if: always() && (hashFiles('**/*_test.go') != '')
+        run: go test -v ./...
+
+      - name: Upload binary as artifact (✅ critical for deployment!)
+        uses: actions/upload-artifact@v4
+        with:
+          name: radio-server-linux-amd64
+          path: radio-server
+          retention-days: 7
