@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,11 +14,12 @@ import (
 	"github.com/joho/godotenv"
 )
 
-func getConfig() (host, port, ytDlpPath, cookiesPath string) {
+func getConfig() (host, port, ytDlpPath, ffmpegPath, cookiesPath string) {
 	_ = godotenv.Load()
 	host = getEnv("HOST", "")
 	port = getEnv("PORT", "8080")
 	ytDlpPath = getEnv("YT_DLP_PATH", "yt-dlp")
+	ffmpegPath = getEnv("FFMPEG_PATH", "ffmpeg")
 	cookiesPath = getEnv("COOKIES_PATH", "")
 	if _, err := strconv.Atoi(port); err != nil {
 		log.Printf("⚠️ Invalid PORT='%s', using 8080", port)
@@ -32,15 +35,40 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func streamHandler(ytDlpPath, cookiesPath string) http.HandlerFunc {
+func listFormats(ytDlpPath, cookiesPath, vidURL string) string {
+	args := []string{"--list-formats"}
+	if cookiesPath != "" {
+		args = append(args, "--cookies", cookiesPath)
+	}
+	args = append(args, vidURL)
+	
+	cmd := exec.Command(ytDlpPath, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "Failed to list formats: " + err.Error()
+	}
+	return string(output)
+}
+
+func streamHandler(ytDlpPath, ffmpegPath, cookiesPath string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		vidURL := r.URL.Query().Get("url")
+		debug := r.URL.Query().Get("debug")
+		
 		if vidURL == "" {
 			http.Error(w, "Missing ?url=...", http.StatusBadRequest)
 			return
 		}
 		if !isYouTubeURL(vidURL) {
 			http.Error(w, "Only YouTube/YouTube Music URLs allowed", http.StatusBadRequest)
+			return
+		}
+
+		if debug == "1" || debug == "true" {
+			w.Header().Set("Content-Type", "text/plain")
+			formats := listFormats(ytDlpPath, cookiesPath, vidURL)
+			w.Write([]byte("=== Available Formats ===\n\n"))
+			w.Write([]byte(formats))
 			return
 		}
 
@@ -52,69 +80,94 @@ func streamHandler(ytDlpPath, cookiesPath string) http.HandlerFunc {
 
 		ctx := r.Context()
 
-		// Robust 2025 YouTube format selection
+		log.Printf("🔍 Starting stream for: %s", vidURL)
+
+		// Build yt-dlp command
 		ytdlpArgs := []string{
-			"--extractor-args", "youtube:player_client=web,ios,android;include_live_dash",
-			"--compat-options", "no-youtube-unavailable-videos",
-			"-f", "best[ext=mp4][acodec~='mp4a']/best[ext=mp4]/best",
-			"--extract-audio",
-			"--audio-format", "mp3",
-			"--audio-quality", "0",
+			"-f", "worst",
 			"-o", "-",
-			"--quiet",
 			"--no-warnings",
 		}
-
+		
 		if cookiesPath != "" {
 			ytdlpArgs = append(ytdlpArgs, "--cookies", cookiesPath)
 		}
 		ytdlpArgs = append(ytdlpArgs, vidURL)
 
-		cmd := exec.CommandContext(ctx, ytDlpPath, ytdlpArgs...)
-		stdout, err := cmd.StdoutPipe()
+		ytdlpCmd := exec.CommandContext(ctx, ytDlpPath, ytdlpArgs...)
+		
+		// Build ffmpeg command
+		ffmpegCmd := exec.CommandContext(ctx, ffmpegPath,
+			"-i", "pipe:0",
+			"-vn",
+			"-f", "mp3",
+			"-ac", "2",
+			"-ar", "44100",
+			"-b:a", "128k",
+			"-loglevel", "warning",
+			"pipe:1",
+		)
+		
+		// Connect yt-dlp stdout to ffmpeg stdin
+		ytdlpStdout, err := ytdlpCmd.StdoutPipe()
 		if err != nil {
-			log.Printf("pipe error: %v", err)
-			http.Error(w, "Internal error", http.StatusInternalServerError)
+			log.Printf("❌ yt-dlp pipe error: %v", err)
+			http.Error(w, "Setup failed", http.StatusInternalServerError)
+			return
+		}
+		ffmpegCmd.Stdin = ytdlpStdout
+		
+		// Capture stderr
+		var ytdlpStderr, ffmpegStderr bytes.Buffer
+		ytdlpCmd.Stderr = &ytdlpStderr
+		ffmpegCmd.Stderr = &ffmpegStderr
+
+		// Get ffmpeg stdout
+		ffmpegStdout, err := ffmpegCmd.StdoutPipe()
+		if err != nil {
+			log.Printf("❌ ffmpeg pipe error: %v", err)
+			http.Error(w, "ffmpeg setup failed", http.StatusInternalServerError)
 			return
 		}
 
-		stderr, _ := cmd.StderrPipe()
-		go func() {
-			buf := make([]byte, 1024)
-			for {
-				n, err := stderr.Read(buf)
-				if n > 0 {
-					log.Printf("yt-dlp: %s", string(buf[:n]))
-				}
-				if err != nil {
-					break
-				}
-			}
-		}()
-
-		if err := cmd.Start(); err != nil {
-			log.Printf("yt-dlp start failed: %v", err)
+		// Start yt-dlp
+		if err := ytdlpCmd.Start(); err != nil {
+			log.Printf("❌ yt-dlp start failed: %v", err)
 			http.Error(w, "yt-dlp failed", http.StatusServiceUnavailable)
 			return
 		}
+		
+		// Start ffmpeg
+		if err := ffmpegCmd.Start(); err != nil {
+			ytdlpCmd.Process.Kill()
+			log.Printf("❌ ffmpeg start failed: %v", err)
+			http.Error(w, "ffmpeg failed", http.StatusInternalServerError)
+			return
+		}
 
+		log.Printf("🎵 Streaming: %s", vidURL)
+
+		// Cleanup on context cancel
 		go func() {
 			<-ctx.Done()
-			cmd.Process.Kill()
+			ytdlpCmd.Process.Kill()
+			ffmpegCmd.Process.Kill()
 			log.Printf("🛑 Stream stopped: %s", vidURL)
 		}()
 
+		// Stream data to client
 		buf := make([]byte, 64*1024)
 		flusher, _ := w.(http.Flusher)
 		total := 0
 
 		for {
-			n, err := stdout.Read(buf)
+			n, err := ffmpegStdout.Read(buf)
 			if n > 0 {
 				total += n
 				if _, e := w.Write(buf[:n]); e != nil {
 					log.Printf("Client left after %d bytes", total)
-					cmd.Process.Kill()
+					ytdlpCmd.Process.Kill()
+					ffmpegCmd.Process.Kill()
 					return
 				}
 				if flusher != nil {
@@ -122,12 +175,30 @@ func streamHandler(ytDlpPath, cookiesPath string) http.HandlerFunc {
 				}
 			}
 			if err != nil {
+				if err != io.EOF {
+					log.Printf("⚠️ Read error: %v", err)
+				}
 				break
 			}
 		}
 
-		cmd.Wait()
-		log.Printf("✅ Stream done: %d bytes", total)
+		// Wait for processes to finish
+		ffmpegCmd.Wait()
+		ytdlpCmd.Wait()
+		
+		// Log any errors
+		if ytdlpStderr.Len() > 0 {
+			log.Printf("yt-dlp stderr: %s", ytdlpStderr.String())
+		}
+		if ffmpegStderr.Len() > 0 {
+			log.Printf("ffmpeg stderr: %s", ffmpegStderr.String())
+		}
+		
+		if total == 0 {
+			log.Printf("❌ WARNING: Stream completed but sent 0 bytes!")
+		}
+		
+		log.Printf("✅ Stream done: %s (%d bytes)", vidURL, total)
 	}
 }
 
@@ -144,7 +215,7 @@ func isYouTubeURL(u string) bool {
 }
 
 func main() {
-	host, port, ytDlpPath, cookiesPath := getConfig()
+	host, port, ytDlpPath, ffmpegPath, cookiesPath := getConfig()
 	addr := net.JoinHostPort(host, port)
 
 	http.HandleFunc("/radio/stream", func(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +226,7 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		streamHandler(ytDlpPath, cookiesPath)(w, r)
+		streamHandler(ytDlpPath, ffmpegPath, cookiesPath)(w, r)
 	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -165,16 +236,18 @@ func main() {
 		if cookiesPath != "" {
 			cookieStatus = cookiesPath
 		}
-		w.Write([]byte(`{"status":"ok","yt_dlp":"` + ytDlpPath + `","cookies":"` + cookieStatus + `"}`))
+		w.Write([]byte(`{"status":"ok","yt_dlp":"` + ytDlpPath + `","ffmpeg":"` + ffmpegPath + `","cookies":"` + cookieStatus + `"}`))
 	})
 
 	log.Printf("📻 Radio Server listening on http://%s", addr)
-	log.Printf("⚙️ Using yt-dlp: %s", ytDlpPath)
+	log.Printf("⚙️ Using yt-dlp: %s | ffmpeg: %s", ytDlpPath, ffmpegPath)
 	if cookiesPath != "" {
 		log.Printf("🍪 Using cookies: %s", cookiesPath)
 	} else {
 		log.Printf("🍪 No cookies configured")
 	}
+	log.Printf("🔍 Debug mode: Add ?debug=1 to see available formats")
+	
 	if host == "" || host == "0.0.0.0" {
 		if ip := getOutboundIP(); ip != "" {
 			log.Printf("🌐 LAN access: http://%s:%s/radio/stream?url=...", ip, port)
