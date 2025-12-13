@@ -1,3 +1,72 @@
+# Binaries for programs and plugins
 *.exe
-*.zip
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# Compiled binaries
+radio-server
+radio-server-*
+!radio-server-linux-amd64
+!radio-server-linux-arm64
+
+# Environment files
 .env
+.env.local
+.env.*.local
+
+# Cookies
+cookies.txt
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.zip
+*.tar.gz
+*.tar.xz
+
+# Temp files
+tmp/
+temp/
+*.tmp
+
+# FFmpeg/yt-dlp binaries (if bundled)
+ffmpeg
+ffmpeg-*
+yt-dlp
+!yt-dlp.sh
+
+# Duplicate/backup files
+main2.go
+main_simple.go
+*.bak
+*.backup
