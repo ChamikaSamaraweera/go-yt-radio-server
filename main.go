@@ -14,6 +14,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var version = "main"
+
 func getConfig() (host, port, ytDlpPath, ffmpegPath, cookiesPath string) {
 	_ = godotenv.Load()
 	host = getEnv("HOST", "")
@@ -215,6 +217,7 @@ func isYouTubeURL(u string) bool {
 }
 
 func main() {
+	log.Printf("Radio Server version: %s", version)
 	host, port, ytDlpPath, ffmpegPath, cookiesPath := getConfig()
 	addr := net.JoinHostPort(host, port)
 
