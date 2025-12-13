@@ -1,47 +1,182 @@
-# .github/workflows/go.yml
-name: Go
+name: Go CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  build:
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5  # ✅ Use v5 (newer, better caching)
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.23'       # ✅ Use latest stable (1.23 as of 2025)
-          cache: true              # ✅ Auto-cache go.mod/go.sum
+          go-version: '1.23'
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
 
       - name: Verify go.mod
         run: |
           if [ ! -f "go.mod" ]; then
-            echo "❌ ERROR: go.mod not found. Is this a Go module?"
+            echo "❌ go.mod not found"
             exit 1
           fi
-          go mod tidy
+          go mod download
+          go mod verify
 
-      - name: Build
+      - name: Run tests
         run: |
-          # Build explicitly with output name (e.g., radio-server)
-          go build -ldflags="-s -w" -o radio-server .
-          ls -lh radio-server
+          if ls *_test.go 1> /dev/null 2>&1; then
+            go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+          else
+            echo "⚠️ No test files found, skipping tests"
+          fi
 
-      - name: (Optional) Test
-        # Skip if no _test.go files — avoids failure
-        if: always() && (hashFiles('**/*_test.go') != '')
-        run: go test -v ./...
+      - name: Upload coverage to Codecov
+        if: hashFiles('coverage.out') != ''
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false
 
-      - name: Upload binary as artifact (✅ critical for deployment!)
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # Windows ARM64 is not commonly used
+          - goos: windows
+            goarch: arm64
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Verify dependencies
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          # Set output filename based on OS
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT="radio-server-${{ matrix.goos }}-${{ matrix.goarch }}.exe"
+          else
+            OUTPUT="radio-server-${{ matrix.goos }}-${{ matrix.goarch }}"
+          fi
+          
+          echo "⚙️ Building $OUTPUT..."
+          go build -v \
+            -ldflags="-s -w -X main.version=dev-${GITHUB_SHA::8}" \
+            -o "$OUTPUT" \
+            main.go
+          
+          # Verify binary was created
+          ls -lh "$OUTPUT"
+          file "$OUTPUT" || true
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: radio-server-linux-amd64
-          path: radio-server
+          name: radio-server-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: radio-server-*
           retention-days: 7
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, security]
+    if: always()
+    steps:
+      - name: Check build status
+        run: |
+          echo "## 🎯 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Lint: ${{ needs.lint.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Test: ${{ needs.test.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Build: ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Security: ${{ needs.security.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${GITHUB_SHA::8}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${GITHUB_REF#refs/heads/}\`" >> $GITHUB_STEP_SUMMARY
